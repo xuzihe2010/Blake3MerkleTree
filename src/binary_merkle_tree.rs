@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::iter::FromIterator;
 use core::cmp::min;
 
 pub const OUT_LEN: usize = 32;
@@ -492,7 +491,7 @@ impl BinaryMerkleTree {
         while nodes_in_this_level > 1 {
             let nodes_parent_level = (nodes_in_this_level + 1) / 2;
 
-            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_tree_indices(current_index);  
+            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_parent_and_validate_right(current_index);  
             if has_right_sibling {
                 let parent_output = parent_output(
                     self.tree[left_node_index].chaining_value(),
@@ -556,7 +555,7 @@ impl BinaryMerkleTree {
                 }
             }
 
-            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_tree_indices(current_index); 
+            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_parent_and_validate_right(current_index); 
             if has_right_sibling {
                 let parent_output = parent_output(
                     self.tree[left_node_index].chaining_value(),
@@ -574,8 +573,16 @@ impl BinaryMerkleTree {
         Some(())
     }
 
-    /// Helper function to calculate tree indices and validations for a given node.
-    fn get_tree_indices(&self, current_index: usize) -> (usize, usize, usize, bool) {
+    /// Given a node index, calculates its parent node index and validates if it has a right sibling.
+    /// Returns a tuple containing:
+    /// - left_node_index: The index of the left child node
+    /// - right_node_index: The index of the right child node (if it exists)
+    /// - parent_index: The index of the parent node
+    /// - has_right_sibling: Whether the current node has a valid right sibling in the tree
+    /// 
+    /// This function is used during tree updates to determine the correct parent-child relationships
+    /// and validate the existence of sibling nodes when propagating changes up the tree.
+    fn get_parent_and_validate_right(&self, current_index: usize) -> (usize, usize, usize, bool) {
         // Calculate current level (0 for leaves, increasing towards root)
         let current_level = if current_index >= self.leaf_start_index {
             0  // Leaf level
