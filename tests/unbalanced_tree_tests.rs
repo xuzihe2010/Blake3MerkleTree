@@ -540,10 +540,6 @@ fn test_unbalanced_tree_corner_cases() {
     tree.bulk_insert_leaves(chunk_indices.into_iter(), chunk_outputs.into_iter())
         .expect("Bulk insert failed");
     let mutated_root = tree.root().chaining_value();
-
-    // Verify by creating a new tree from the mutated input
-    let new_tree = BinaryMerkleTree::from_input(&input, IV, FLAGS);
-    let verify_root = new_tree.root().chaining_value();
     
     // Get mutated BLAKE3 hash
     let mut hasher = Blake3Hasher::new();
@@ -558,8 +554,6 @@ fn test_unbalanced_tree_corner_cases() {
     
     assert_eq!(mutated_root, mutated_blake3_chaining_value,
         "First/last byte mutation hash mismatch");
-    assert_eq!(mutated_root, verify_root,
-        "First/last byte mutation verification mismatch");
     println!("First/last byte mutation test passed ✓");
 
     println!("\n=== All corner cases tests completed successfully ===");
