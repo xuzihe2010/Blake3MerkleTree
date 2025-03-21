@@ -3,7 +3,6 @@ use std::iter::FromIterator;
 use core::cmp::min;
 
 pub const OUT_LEN: usize = 32;
-pub const KEY_LEN: usize = 32;
 pub const BLOCK_LEN: usize = 64;
 pub const CHUNK_LEN: usize = 1024;
 
@@ -11,14 +10,15 @@ const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
 pub const ROOT: u32 = 1 << 3;
-const KEYED_HASH: u32 = 1 << 4;
-const DERIVE_KEY_CONTEXT: u32 = 1 << 5;
-const DERIVE_KEY_MATERIAL: u32 = 1 << 6;
 
 pub const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
+pub const FLAGS: u32 = 0;
 
+// =============================================
+// COPIED DIRECTLY FROM BLAKE3 reference_impl.rs
+// =============================================
 // Each chunk or parent node can produce either an 8-word chaining value or, by
 // setting the ROOT flag, any number of final output bytes. The Output struct
 // captures the state just prior to choosing between those two possibilities.
@@ -70,13 +70,14 @@ pub fn parent_output(
     let mut block_words = [0; 16];
     block_words[..8].copy_from_slice(&left_child_cv);
     block_words[8..].copy_from_slice(&right_child_cv);
-    Output {
+    let output = Output {
         input_chaining_value: key_words,
         block_words,
         counter: 0,                  // Always 0 for parent nodes.
         block_len: BLOCK_LEN as u32, // Always BLOCK_LEN (64) for parent nodes.
         flags: PARENT | flags,
-    }
+    };
+    output
 }
 
 fn first_8_words(compression_output: [u32; 16]) -> [u32; 8] {
@@ -163,6 +164,9 @@ fn words_from_little_endian_bytes(bytes: &[u8], words: &mut [u32]) {
     }
 }
 
+// =============================================
+// COPIED DIRECTLY FROM BLAKE3 reference_impl.rs
+// =============================================
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkState {
     pub chaining_value: [u32; 8],
@@ -248,6 +252,9 @@ pub fn parent_cv(
     parent_output(left_child_cv, right_child_cv, key_words, flags).chaining_value()
 }
 
+// =============================================
+// COPIED DIRECTLY FROM BLAKE3 reference_impl.rs
+// =============================================
 /// An incremental hasher that can accept any number of writes.
 pub struct Blake3Hasher {
     chunk_state: ChunkState,
@@ -271,25 +278,6 @@ impl Blake3Hasher {
     /// Construct a new `Hasher` for the regular hash function.
     pub fn new() -> Self {
         Self::new_internal(IV, 0)
-    }
-
-    /// Construct a new `Hasher` for the keyed hash function.
-    pub fn new_keyed(key: &[u8; KEY_LEN]) -> Self {
-        let mut key_words = [0; 8];
-        words_from_little_endian_bytes(key, &mut key_words);
-        Self::new_internal(key_words, KEYED_HASH)
-    }
-
-    /// Construct a new `Hasher` for the key derivation function. The context
-    /// string should be hardcoded, globally unique, and application-specific.
-    pub fn new_derive_key(context: &str) -> Self {
-        let mut context_hasher = Self::new_internal(IV, DERIVE_KEY_CONTEXT);
-        context_hasher.update(context.as_bytes());
-        let mut context_key = [0; KEY_LEN];
-        context_hasher.finalize(&mut context_key);
-        let mut context_key_words = [0; 8];
-        words_from_little_endian_bytes(&context_key, &mut context_key_words);
-        Self::new_internal(context_key_words, DERIVE_KEY_MATERIAL)
     }
 
     fn push_stack(&mut self, cv: [u32; 8]) {
@@ -360,17 +348,38 @@ impl Blake3Hasher {
 
 #[derive(Debug, Clone)]
 pub struct BinaryMerkleTree {
-    pub tree: Vec<Output>,
+    tree: Vec<Output>,
+    actual_leaves: usize,
+    number_of_leaves: usize,
+    leaf_start_index: usize,
+    key_words: [u32; 8],
+    flags: u32,
 }
 
 impl BinaryMerkleTree {
-    pub fn new_from_leaves(leaves: Vec<Output>) -> BinaryMerkleTree {
-        // Initialize a zero vector with the correct number of nodes
+    pub fn new_from_leaves(leaves: Vec<Output>, key_words: [u32; 8], flags: u32) -> Self {
+        let actual_leaves = leaves.len();
+        // Calculate the next power of two to allocate enough space
         let number_of_leaves = leaves.len().next_power_of_two();
-        let mut tree = Self::new_empty(number_of_leaves as u64);
+        let nodes = vec![Output {
+            input_chaining_value: key_words,
+            block_words: [0; 16],
+            counter: 0,
+            block_len: 64,
+            flags,
+        }; 2 * number_of_leaves];
 
-        tree.create_tree_from_leaves(leaves);
-        tree
+        // Create a new tree with the actual number of leaves
+        let mut binary_tree = BinaryMerkleTree { 
+            tree: nodes,
+            actual_leaves,
+            number_of_leaves,
+            leaf_start_index: number_of_leaves,
+            key_words,
+            flags,
+        };
+        binary_tree.create_tree_from_leaves(leaves);
+        binary_tree
     }
 
     pub fn root(&self) -> Output {
@@ -381,24 +390,22 @@ impl BinaryMerkleTree {
     }
 
     pub fn num_leaves(&self) -> usize {
-        self.tree.len() / 2
+        self.number_of_leaves
     }
 
-    pub fn get_tree_length(&self) -> usize {
-        self.tree.len() - 1 // Minus one because the tree is 1-indexed
+    pub fn actual_leaves(&self) -> usize {
+        self.actual_leaves
     }
 
-    pub fn new_empty(number_of_leaves: u64) -> Self {
-        assert!(number_of_leaves.is_power_of_two());
-        let empty_output = Output {
-            input_chaining_value: IV,
-            block_words: [0; 16],
-            counter: 0,
-            block_len: 64,
-            flags: 0,
-        };
-        let tree: Vec<Output> = vec![empty_output; 2 * number_of_leaves as usize];
-        BinaryMerkleTree { tree }
+    fn get_sibling_index(index: usize) -> usize {
+        // Bit-wise XOR to get the sibling index
+        // Example: Sibling of index 4(0b100) is 5(0b101) and sibling of index 5(0b101) is 4(0b100)
+        index ^ 1
+    }
+
+    fn is_left(index: usize) -> bool {
+        // All left-children have an even node index
+        index % 2 == 0
     }
 
     // The parent of a node is always at node_index / 2
@@ -406,55 +413,104 @@ impl BinaryMerkleTree {
         index >> 1
     }
 
+    /// Given an index of the current node, identify its direct sibling,
+    /// identify which node is left, which is right, and return them.
+    fn get_left_and_right_node_indices_from_index(&self, current_index: usize) -> (usize, usize) {
+        let sibling_index = BinaryMerkleTree::get_sibling_index(current_index);
+
+        // Use boolean indexing to avoid if statement branching
+        let node_pair = [current_index, sibling_index]; // Stack allocation
+
+        // If the sibling is the left child, is_left returns 1 and gets the sibling
+        // If the sibling is the right child, is_left returns 0 and gets the node to update (the left child)
+        let left_node_index = node_pair[BinaryMerkleTree::is_left(sibling_index) as usize];
+
+        // If the node to update is the left child, is_left returns 1 and gets the sibling (the right child)
+        // If the node to update is the right child, is_left returns 0 and gets the node to update
+        let right_node_index = node_pair[BinaryMerkleTree::is_left(current_index) as usize];
+
+        (left_node_index, right_node_index)
+    }
+
     fn create_tree_from_leaves(&mut self, leaves: Vec<Output>) {
-        // Copy the leaves into the end of the tree
-        let number_of_leaves = leaves.len();
-        self.tree
-            .splice(self.tree.capacity() - number_of_leaves.., leaves);
-        // If there is only one leaf (plus the filler first node), the tree is simply that leaf
-        if number_of_leaves == 1 {
+        // Copy the actual leaves into the end of the tree
+        for (i, leaf) in leaves.into_iter().enumerate() {
+            self.tree[self.leaf_start_index + i] = leaf;
+        }
+
+        // If there is only one leaf, the tree is simply that leaf
+        if self.actual_leaves == 1 {
+            self.tree[1] = self.tree[self.leaf_start_index];
             return;
         }
 
-        // Build ancestors
-        let leaf_start_index = self.get_tree_length() / 2 + 1;
-        let leaves_with_indices = self.tree[leaf_start_index..]
-            .iter()
-            .copied()
-            .zip(leaf_start_index..leaf_start_index + number_of_leaves);
-        let mut hash_queue = VecDeque::from_iter(leaves_with_indices);
-        while hash_queue.len() > 1 {
-            let (left_child, left_index) = hash_queue.pop_front().unwrap();
-            let (right_child, _right_index) = hash_queue.pop_front().unwrap();
-            let parent_output = parent_output(left_child.chaining_value(), right_child.chaining_value(), IV, 0);
-            let parent_index = BinaryMerkleTree::get_parent_index(left_index);
-            self.tree[parent_index] = parent_output;
-            hash_queue.push_back((parent_output, parent_index));
+        // Build ancestors level by level, from bottom to top
+        let mut current_level_start = self.leaf_start_index;
+        let mut nodes_at_current_level = self.actual_leaves;
+        
+        while current_level_start > 1 {
+            let parent_level_start = current_level_start / 2;
+            let nodes_in_parent_level = (nodes_at_current_level + 1) / 2;
+
+            for i in 0..nodes_in_parent_level {
+                let left_index = current_level_start + 2 * i;
+                let right_index = left_index + 1;
+                let parent_index = parent_level_start + i;
+
+                // For the last node in a level, if it doesn't have a right sibling,
+                // promote the left node directly to be the parent
+                if 2 * i + 1 >= nodes_at_current_level {
+                    self.tree[parent_index] = self.tree[left_index];
+                } else {
+                    // If we have both left and right children, create a parent node
+                    self.tree[parent_index] = parent_output(
+                        self.tree[left_index].chaining_value(),
+                        self.tree[right_index].chaining_value(),
+                        self.key_words,
+                        self.flags,
+                    );
+                }
+            }
+            current_level_start = parent_level_start;
+            nodes_at_current_level = nodes_in_parent_level;
         }
     }
 
     pub fn insert_leaf(&mut self, leaf_index: usize, leaf_output: Output) {
-        let real_leaf_index = leaf_index + self.num_leaves();
+        if leaf_index >= self.actual_leaves {
+            panic!("Leaf index {} is out of bounds for tree with {} leaves", leaf_index, self.actual_leaves);
+        }
+
+        let real_leaf_index = leaf_index + self.leaf_start_index;
+        // First, update the leaf node
         self.tree[real_leaf_index] = leaf_output;
-
+        
+        // Then propagate changes up the tree
+        let mut nodes_in_this_level = self.actual_leaves;
         let mut current_index = real_leaf_index;
-        while current_index > 1 {
-            // Update parent
-            let parent_index = BinaryMerkleTree::get_parent_index(current_index);
-            let (left_node_index, right_node_index) =
-                self.get_left_and_right_node_indices_from_index(current_index);
-            let left_node = &self.tree[left_node_index];
-            let right_node = &self.tree[right_node_index];
+        
+        while nodes_in_this_level > 1 {
+            let nodes_parent_level = (nodes_in_this_level + 1) / 2;
 
-            let parent_output = parent_output(left_node.chaining_value(), right_node.chaining_value(), IV, 0);
-            self.tree[parent_index] = parent_output;
+            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_tree_indices(current_index);  
+            if has_right_sibling {
+                let parent_output = parent_output(
+                    self.tree[left_node_index].chaining_value(),
+                    self.tree[right_node_index].chaining_value(),
+                    self.key_words,
+                    self.flags,
+                );
+                
+                self.tree[parent_index] = parent_output;
+            } else {
+                self.tree[parent_index] = self.tree[left_node_index];
+            }
+            
             current_index = parent_index;
+            nodes_in_this_level = nodes_parent_level;
         }
     }
 
-    /// Bulk insert leaves and propogate hash updates to all ancestors.
-    /// This method avoid updating shared parents if given two direct siblings to update.
-    /// Leaf_index input should be 0-indexed where the first leaf would be entered as index 0
     pub fn bulk_insert_leaves<I, J>(
         &mut self,
         leaf_indices_iter: I,
@@ -500,86 +556,114 @@ impl BinaryMerkleTree {
                 }
             }
 
-            let (left_node_index, right_node_index) =
-                self.get_left_and_right_node_indices_from_index(current_index);
-            let left_node = self.tree[left_node_index];
-            let right_node = self.tree[right_node_index];
-
-            let parent_output = parent_output(left_node.chaining_value(), right_node.chaining_value(), IV, 0);
-            let parent_index = BinaryMerkleTree::get_parent_index(current_index);
-            self.tree[parent_index] = parent_output;
+            let (left_node_index, right_node_index, parent_index, has_right_sibling) = self.get_tree_indices(current_index); 
+            if has_right_sibling {
+                let parent_output = parent_output(
+                    self.tree[left_node_index].chaining_value(),
+                    self.tree[right_node_index].chaining_value(),
+                    self.key_words,
+                    self.flags,
+                );
+                self.tree[parent_index] = parent_output;
+            } else {
+                self.tree[parent_index] = self.tree[left_node_index];
+            }
             update_queue.push_back(parent_index);
         }
 
         Some(())
     }
 
-    fn get_sibling_index(index: usize) -> usize {
-        // Bit-wise XOR to get the sibling index
-        // Example: Sibling of index 4(0b100) is 5(0b101) and sibling of index 5(0b101) is 4(0b100)
-        index ^ 1
+    /// Helper function to calculate tree indices and validations for a given node.
+    fn get_tree_indices(&self, current_index: usize) -> (usize, usize, usize, bool) {
+        // Calculate current level (0 for leaves, increasing towards root)
+        let current_level = if current_index >= self.leaf_start_index {
+            0  // Leaf level
+        } else {
+            let mut level = 0;
+            let mut nodes_in_level = self.actual_leaves;
+            
+            // Calculate level by counting down from root
+            while nodes_in_level > 1 {
+                nodes_in_level = (nodes_in_level + 1) / 2;
+                if current_index >= (self.leaf_start_index >> level) {
+                    break;
+                }
+                level += 1;
+            }
+            level
+        };
+
+        // Calculate indices for current level
+        let level_start = self.leaf_start_index >> current_level;
+        let nodes_in_level = if current_level == 0 {
+            self.actual_leaves
+        } else {
+            let mut nodes = self.actual_leaves;
+            for _ in 0..current_level {
+                nodes = (nodes + 1) / 2;
+            }
+            nodes
+        };
+        
+        // Calculate left and right indices
+        let (left_index, right_index) =
+                self.get_left_and_right_node_indices_from_index(current_index);
+        // Calculate parent index
+        let parent_index = BinaryMerkleTree::get_parent_index(current_index);
+
+        // Check if right sibling is valid
+        let has_right_sibling = right_index < level_start + nodes_in_level;
+
+        (left_index, right_index, parent_index, has_right_sibling)
     }
 
-    fn is_left(index: usize) -> bool {
-        // All left-children have an even node index
-        index % 2 == 0
-    }
+    /// Process arbitrary input bytes into a vector of Output structs.
+    /// This function:
+    /// 1. Splits input into chunks of 1024 bytes
+    /// 2. For each chunk, splits into blocks of 64 bytes
+    /// 3. Creates a ChunkState for each chunk and processes its blocks
+    /// 4. Returns a vector of Output structs ready for Merkle tree construction
+    fn process_input_to_chunks(input: &[u8], key_words: [u32; 8], flags: u32) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        let mut chunk_state = ChunkState::new(key_words, 0, flags);
+        let mut input = input;
 
-    /// Given an index of the current node, identify its direct sibling,
-    /// identify which node is left, which is right, and return them.
-    fn get_left_and_right_node_indices_from_index(&self, current_index: usize) -> (usize, usize) {
-        let sibling_index = BinaryMerkleTree::get_sibling_index(current_index);
+        while !input.is_empty() {
+            // If the current chunk is complete, finalize it and reset the
+            // chunk state. More input is coming, so this chunk is not ROOT.
+            if chunk_state.len() == CHUNK_LEN {
+                let chunk_output = chunk_state.output();
+                outputs.push(chunk_output);
+                let total_chunks = chunk_state.chunk_counter + 1;
+                chunk_state = ChunkState::new(key_words, total_chunks, flags);
+            }
 
-        // Use boolean indexing to avoid if statement branching
-        let node_pair = [current_index, sibling_index]; // Stack allocation
-
-        // If the sibling is the left child, is_left returns 1 and gets the sibling
-        // If the sibling is the right child, is_left returns 0 and gets the node to update (the left child)
-        let left_node_index = node_pair[BinaryMerkleTree::is_left(sibling_index) as usize];
-
-        // If the node to update is the left child, is_left returns 1 and gets the sibling (the right child)
-        // If the node to update is the right child, is_left returns 0 and gets the node to update
-        let right_node_index = node_pair[BinaryMerkleTree::is_left(current_index) as usize];
-
-        (left_node_index, right_node_index)
-    }
-} 
-
-/// Process arbitrary input bytes into a vector of Output structs.
-/// This function:
-/// 1. Splits input into chunks of 1024 bytes
-/// 2. For each chunk, splits into blocks of 64 bytes
-/// 3. Creates a ChunkState for each chunk and processes its blocks
-/// 4. Returns a vector of Output structs ready for Merkle tree construction
-pub fn process_input_to_chunks(input: &[u8]) -> Vec<Output> {
-    const CHUNK_LEN: usize = 1024;
-    const BLOCK_LEN: usize = 64;
-    let mut outputs = Vec::new();
-    let mut chunk_state = ChunkState::new(IV, 0, 0);
-    let mut input = input;
-
-    while !input.is_empty() {
-        // If the current chunk is complete, finalize it and reset the
-        // chunk state. More input is coming, so this chunk is not ROOT.
-        if chunk_state.len() == CHUNK_LEN {
-            let chunk_output = chunk_state.output();
-            outputs.push(chunk_output);
-            let total_chunks = chunk_state.chunk_counter + 1;
-            chunk_state = ChunkState::new(IV, total_chunks, 0);
+            // Compress input bytes into the current chunk state.
+            let want = CHUNK_LEN - chunk_state.len();
+            let take = min(want, input.len());
+            chunk_state.update(&input[..take]);
+            input = &input[take..];
         }
 
-        // Compress input bytes into the current chunk state.
-        let want = CHUNK_LEN - chunk_state.len();
-        let take = min(want, input.len());
-        chunk_state.update(&input[..take]);
-        input = &input[take..];
+        // Add the final chunk if it's not empty
+        if chunk_state.len() > 0 {
+            let chunk_output = chunk_state.output();
+            outputs.push(chunk_output);
+        }
+
+        // If no chunks were produced, add a dummy chunk with the initial chaining value
+        if outputs.is_empty() {
+            outputs.push(ChunkState::new(key_words, 0, flags).output());
+        }
+        
+        outputs
     }
 
-    // Add the final chunk if it's not empty
-    if chunk_state.len() > 0 {
-        let chunk_output = chunk_state.output();
-        outputs.push(chunk_output);
+    /// Construct a new BinaryMerkleTree directly from arbitrary raw bytes input.
+    /// This method is equivalent to calling process_input_to_chunks and then new_from_leaves.
+    pub fn from_input(input: &[u8], key_words: [u32; 8], flags: u32) -> Self {
+        let chunk_outputs = Self::process_input_to_chunks(input, key_words, flags);
+        Self::new_from_leaves(chunk_outputs, key_words, flags)
     }
-    
-    outputs
 }
